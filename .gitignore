@@ -1,0 +1,30 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+/agent
+/agent.exe
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / tools
+.claude/
+.vscode/
+.idea/
+
+# Crash dumps
+*.stackdump
+
+# Go test cache
+*.test
+*.out
+
+# Temp
+tmp/

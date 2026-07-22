@@ -9,11 +9,37 @@ import (
 	"fmt"
 	"iter"
 	"net/http"
+	"sync"
 
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/model"
 )
+
+// UsageAccumulator soma tokens de todas as chamadas LLM dentro de um run.
+type UsageAccumulator struct {
+	mu  sync.Mutex
+	In  int64
+	Out int64
+}
+
+func (a *UsageAccumulator) add(in, out int) {
+	a.mu.Lock()
+	a.In += int64(in)
+	a.Out += int64(out)
+	a.mu.Unlock()
+}
+
+type usageKey struct{}
+
+func WithUsageAccumulator(ctx context.Context, acc *UsageAccumulator) context.Context {
+	return context.WithValue(ctx, usageKey{}, acc)
+}
+
+func accFromCtx(ctx context.Context) *UsageAccumulator {
+	acc, _ := ctx.Value(usageKey{}).(*UsageAccumulator)
+	return acc
+}
 
 type Model struct {
 	baseURL   string // e.g. "http://localhost:1234/v1"
@@ -83,8 +109,43 @@ func (m *Model) GenerateContent(ctx context.Context, req *model.LLMRequest, _ bo
 			return
 		}
 
+		if acc := accFromCtx(ctx); acc != nil {
+			acc.add(result.Usage.PromptTokens, result.Usage.CompletionTokens)
+		}
 		yield(oaiToLLMResponse(result.Choices[0]), nil)
 	}
+}
+
+// Generate faz uma chamada LLM single-turn — usado pelo runner de eval.
+func (m *Model) Generate(ctx context.Context, prompt string) (string, error) {
+	payload := oaiRequest{
+		Model:    m.modelName,
+		Messages: []oaiMessage{{Role: "user", Content: prompt}},
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("openaicompat: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var buf bytes.Buffer
+		buf.ReadFrom(resp.Body)
+		return "", fmt.Errorf("openaicompat %d: %s", resp.StatusCode, buf.String())
+	}
+	var result oaiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("openaicompat: empty choices")
+	}
+	return result.Choices[0].Message.Content, nil
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -128,8 +189,14 @@ type oaiChoice struct {
 	FinishReason string     `json:"finish_reason"`
 }
 
+type oaiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
 type oaiResponse struct {
 	Choices []oaiChoice `json:"choices"`
+	Usage   oaiUsage    `json:"usage"`
 }
 
 // ── translators ──────────────────────────────────────────────────────────────

@@ -8,17 +8,40 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 )
+
+const rulesCacheTTL = 30 * time.Second
+
+type rulesCacheEntry struct {
+	rules []GuardrailRule
+	at    time.Time
+}
+
+type evalsCacheEntry struct {
+	configs []EvalConfig
+	at      time.Time
+}
 
 type Client struct {
 	url   string
 	token string
 	http  *http.Client
+
+	mu         sync.Mutex
+	rulesCache map[string]rulesCacheEntry // key: source+":"+stage
+	evalsCache map[string]evalsCacheEntry // key: source
 }
 
 func New(url, token string) *Client {
-	return &Client{url: url, token: token, http: &http.Client{Timeout: 5 * time.Second}}
+	return &Client{
+		url:        url,
+		token:      token,
+		http:       &http.Client{Timeout: 5 * time.Second},
+		rulesCache: make(map[string]rulesCacheEntry),
+		evalsCache: make(map[string]evalsCacheEntry),
+	}
 }
 
 func (c *Client) Enabled() bool {
@@ -33,6 +56,12 @@ type RunInput struct {
 	Status    string
 	StartedAt time.Time
 	EndedAt   time.Time
+	UserID    string
+	Model     string
+	Provider  string
+	TokensIn  int64
+	TokensOut int64
+	CostUSD   float64
 }
 
 // PushRun cria a run no guard e devolve o run_id — string vazia se
@@ -42,9 +71,25 @@ func (c *Client) PushRun(in RunInput) string {
 		return ""
 	}
 	body := map[string]any{
-		"source": in.Source, "name": in.Name, "status": in.Status,
-		"started_at": in.StartedAt.UTC().Format(time.RFC3339), "ended_at": in.EndedAt.UTC().Format(time.RFC3339),
-		"input": jsonString(in.Question), "output": jsonString(in.Answer),
+		"source":     in.Source,
+		"name":       in.Name,
+		"status":     in.Status,
+		"started_at": in.StartedAt.UTC().Format(time.RFC3339),
+		"ended_at":   in.EndedAt.UTC().Format(time.RFC3339),
+		"input":      jsonString(in.Question),
+		"output":     jsonString(in.Answer),
+		"tokens_in":  in.TokensIn,
+		"tokens_out": in.TokensOut,
+		"cost_usd":   in.CostUSD,
+	}
+	if in.UserID != "" {
+		body["user_id"] = in.UserID
+	}
+	if in.Model != "" {
+		body["model"] = in.Model
+	}
+	if in.Provider != "" {
+		body["provider"] = in.Provider
 	}
 	return c.post("/v1/runs", body)
 }
@@ -77,12 +122,19 @@ type EvalConfig struct {
 	Enabled    bool            `json:"enabled"`
 }
 
-// FetchEvalConfigs busca os evaluators ativos pra este source — nil (sem
-// erro) se desabilitado ou se a chamada falhar, nunca bloqueia o agente.
+// FetchEvalConfigs busca os evaluators ativos pra este source.
+// Resultado cacheado por 30s.
 func (c *Client) FetchEvalConfigs(source string) []EvalConfig {
 	if !c.Enabled() {
 		return nil
 	}
+	c.mu.Lock()
+	if e, ok := c.evalsCache[source]; ok && time.Since(e.at) < rulesCacheTTL {
+		c.mu.Unlock()
+		return e.configs
+	}
+	c.mu.Unlock()
+
 	req, err := http.NewRequest(http.MethodGet, c.url+"/v1/eval-configs?source="+source+"&enabled=true", nil)
 	if err != nil {
 		return nil
@@ -95,7 +147,116 @@ func (c *Client) FetchEvalConfigs(source string) []EvalConfig {
 	defer resp.Body.Close()
 	var out []EvalConfig
 	json.NewDecoder(resp.Body).Decode(&out) //nolint:errcheck
+
+	c.mu.Lock()
+	c.evalsCache[source] = evalsCacheEntry{configs: out, at: time.Now()}
+	c.mu.Unlock()
 	return out
+}
+
+// GuardrailRule espelha a regra cadastrada no guard (subset dos campos necessários).
+type GuardrailRule struct {
+	ID      string          `json:"id"`
+	Name    string          `json:"name"`
+	Type    string          `json:"type"`   // regex | keyword | external_webhook
+	Config  json.RawMessage `json:"config"` // struct dependente do Type
+	Stage   string          `json:"stage"`  // input | output | both
+	Action  string          `json:"action"` // flag | block
+	Enabled bool            `json:"enabled"`
+}
+
+// FetchRules busca as regras ativas para a source, filtradas por stage (client-side).
+// Resultado cacheado por 30s — regras raramente mudam entre requests.
+func (c *Client) FetchRules(source, stage string) []GuardrailRule {
+	if !c.Enabled() {
+		return nil
+	}
+	key := source + ":" + stage
+	c.mu.Lock()
+	if e, ok := c.rulesCache[key]; ok && time.Since(e.at) < rulesCacheTTL {
+		c.mu.Unlock()
+		return e.rules
+	}
+	c.mu.Unlock()
+
+	url := c.url + "/v1/rules?enabled=true"
+	if source != "" {
+		url += "&source=" + source
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("X-Guard-Token", c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var all []GuardrailRule
+	json.NewDecoder(resp.Body).Decode(&all) //nolint:errcheck
+
+	var out []GuardrailRule
+	if stage == "" {
+		out = all
+	} else {
+		for _, r := range all {
+			if r.Stage == stage || r.Stage == "both" {
+				out = append(out, r)
+			}
+		}
+	}
+	c.mu.Lock()
+	c.rulesCache[key] = rulesCacheEntry{rules: out, at: time.Now()}
+	c.mu.Unlock()
+	return out
+}
+
+// SpanInput descreve uma tool call capturada pelo hook do ADK.
+type SpanInput struct {
+	RunID     string
+	ToolName  string
+	Args      map[string]any
+	Result    map[string]any
+	StartedAt time.Time
+	EndedAt   time.Time
+	Error     string
+}
+
+// PushSpan reporta um span de tool call filho da run. Best-effort, sem erro.
+func (c *Client) PushSpan(in SpanInput) {
+	if !c.Enabled() || in.RunID == "" {
+		return
+	}
+	body := map[string]any{
+		"run_id":      in.RunID,
+		"tool_name":   in.ToolName,
+		"args":        in.Args,
+		"result":      in.Result,
+		"started_at":  in.StartedAt.UTC().Format(time.RFC3339Nano),
+		"ended_at":    in.EndedAt.UTC().Format(time.RFC3339Nano),
+		"duration_ms": in.EndedAt.Sub(in.StartedAt).Milliseconds(),
+	}
+	if in.Error != "" {
+		body["error"] = in.Error
+	}
+	c.post("/v1/spans", body)
+}
+
+// PushGuardrailEvent registra uma violação de regra atrelada a uma run.
+func (c *Client) PushGuardrailEvent(runID, ruleID, ruleName, stage, verdict, snippet string) {
+	if !c.Enabled() || runID == "" {
+		return
+	}
+	body := map[string]any{
+		"run_id":    runID,
+		"rule_id":   ruleID,
+		"rule_name": ruleName,
+		"stage":     stage,
+		"verdict":   verdict,
+		"snippet":   snippet,
+	}
+	c.post("/v1/guardrail-events", body)
 }
 
 func (c *Client) post(path string, body map[string]any) string {
