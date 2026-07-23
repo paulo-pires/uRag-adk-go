@@ -124,9 +124,6 @@ func buildSessionService() session.Service {
 		postgres.Open(dsn),
 		&gorm.Config{
 			Logger: gormlogger.Default.LogMode(gormlogger.Silent),
-			NamingStrategy: schema.NamingStrategy{
-				TablePrefix: "adk_",
-			},
 		},
 	)
 	if err != nil {
