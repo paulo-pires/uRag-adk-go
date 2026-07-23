@@ -120,10 +120,32 @@ func buildSessionService() session.Service {
 	if dsn == "" {
 		return session.InMemoryService()
 	}
+
+	// Isola tabelas do ADK no schema "adk" para evitar conflito com
+	// tabela "sessions" do urag-guard e FKs quebradas pelo TablePrefix.
+	adkDSN := dsn
+	if !strings.Contains(adkDSN, "search_path") {
+		if strings.Contains(adkDSN, "?") {
+			adkDSN += "&search_path=adk"
+		} else {
+			adkDSN += "?search_path=adk"
+		}
+	}
+
+	// Cria o schema adk e configura pra usar ele (tabelas ficam isoladas)
+	rawDB, err := gorm.Open(postgres.Open(adkDSN), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("session db open: %v", err)
+	}
+	rawDB.Exec("CREATE SCHEMA IF NOT EXISTS adk")
+
 	svc, err := sessiondb.NewSessionService(
-		postgres.Open(dsn),
+		postgres.Open(adkDSN),
 		&gorm.Config{
 			Logger: gormlogger.Default.LogMode(gormlogger.Silent),
+			NamingStrategy: schema.NamingStrategy{
+				TablePrefix: "adk_",
+			},
 		},
 	)
 	if err != nil {
@@ -132,7 +154,7 @@ func buildSessionService() session.Service {
 	if err := sessiondb.AutoMigrate(svc); err != nil {
 		log.Fatalf("session db migrate: %v", err)
 	}
-	log.Printf("  Sessions: Postgres (%s)", maskDSN(dsn))
+	log.Printf("  Sessions: Postgres schema=adk (%s)", maskDSN(dsn))
 	return svc
 }
 
