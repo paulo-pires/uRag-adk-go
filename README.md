@@ -19,7 +19,7 @@ urag-adk-go  --MCP (Streamable HTTP)--▶  uRag-go (:8080 / URAG_MCP_URL)
 Disponível como servidor MCP HTTP (`agent_ask`). Quem chama: o
 [`uRag-gateway-go`](../uRag-gateway-go) (rota `/ask` com estratégia "agent"),
 o [`uRag-workflow-go`](../uRag-workflow-go) (nó `agentNode`) e o
-[`ignus-code-landing-page`](../ignus-code-landing-page) via proxy.
+[`ignus-code-landing-page`](../ignus-code-landing-page) via proxy (`urag_proxy/`).
 
 ## Pré-requisitos
 
