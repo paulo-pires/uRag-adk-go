@@ -160,6 +160,7 @@ func main() {
 	llm := openaicompat.New(
 		getenv("LM_STUDIO_URL", "http://localhost:1234/v1"),
 		getenv("LM_STUDIO_MODEL", "gemma-4-e2b-it"),
+		getenv("LLM_PROXY_KEY", os.Getenv("PLATFORM_OPENROUTER_KEY")),
 	)
 
 	mcpURL := getenv("URAG_MCP_URL", "http://localhost:8080")
@@ -504,7 +505,87 @@ func main() {
 		},
 	)
 
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{Stateless: true})
+
+	// ── Copilotos: injetar runAgentFunc ──────────────────────────────────────────
+	// runAgentFunc permite que os handlers REST dos copilotos chamem o loop ReAct
+	// sem precisar conhecer os detalhes internos do ADK runner.
+	runAgentFunc = func(ctx context.Context, question, systemPrompt, sessionID, userID string) (string, string, error) {
+		startedAt := time.Now()
+
+		uID := "workflow"
+		if userID != "" {
+			uID = userID
+		}
+
+		var adkSessionID string
+		if sessionID != "" {
+			if id, ok := sessions.Load(sessionID); ok {
+				adkSessionID = id.(string)
+			}
+		}
+		if adkSessionID == "" {
+			sess, err := sessionSvc.Create(ctx, &session.CreateRequest{
+				AppName: "urag-adk", UserID: uID,
+			})
+			if err != nil {
+				return "", "", err
+			}
+			adkSessionID = sess.Session.ID()
+			if sessionID != "" {
+				sessions.Store(sessionID, adkSessionID)
+			}
+		}
+		returnSessID := sessionID
+		if returnSessID == "" {
+			returnSessID = adkSessionID
+		}
+
+		var msgPrefix strings.Builder
+		if systemPrompt != "" {
+			msgPrefix.WriteString("<system>\n")
+			msgPrefix.WriteString(systemPrompt)
+			msgPrefix.WriteString("\n</system>\n")
+		}
+
+		fullQuestion := question
+		if msgPrefix.Len() > 0 {
+			fullQuestion = msgPrefix.String() + question
+		}
+
+		spanbuf := newSpanBuffer()
+		r, err := buildOrGetRunner(nil)
+		if err != nil {
+			return "", "", err
+		}
+		acc := &openaicompat.UsageAccumulator{}
+		ctx = openaicompat.WithUsageAccumulator(ctx, acc)
+		ctx = withSpanBuffer(ctx, spanbuf)
+
+		var answerBuf strings.Builder
+		msg := genai.NewContentFromText(fullQuestion, genai.RoleUser)
+		for ev, err := range r.Run(ctx, uID, adkSessionID, msg, adkagent.RunConfig{}) {
+			if err != nil {
+				return "", returnSessID, err
+			}
+			if ev == nil || ev.Content == nil {
+				continue
+			}
+			if ev.IsFinalResponse() {
+				for _, p := range ev.Content.Parts {
+					answerBuf.WriteString(p.Text)
+				}
+			}
+		}
+
+		answer := answerBuf.String()
+		_ = startedAt // evitar unused
+
+		return answer, returnSessID, nil
+	}
+
+	// ── Copilotos: inicializar DB e rotas ─────────────────────────────────────────
+	initCopilotDB()
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
@@ -512,6 +593,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+	registerCopilotRoutes(mux)
 
 	addr := getenv("AGENT_HTTP_ADDR", ":8081")
 	log.Printf("uRag ADK agent (MCP) ouvindo em %s", addr)

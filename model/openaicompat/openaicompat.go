@@ -44,11 +44,12 @@ func accFromCtx(ctx context.Context) *UsageAccumulator {
 type Model struct {
 	baseURL   string // e.g. "http://localhost:1234/v1"
 	modelName string // passed as "model" field; LM Studio accepts whatever is loaded
+	apiKey    string // Bearer token para o proxy (vazio = sem auth)
 	client    *http.Client
 }
 
-func New(baseURL, modelName string) *Model {
-	return &Model{baseURL: baseURL, modelName: modelName, client: http.DefaultClient}
+func New(baseURL, modelName, apiKey string) *Model {
+	return &Model{baseURL: baseURL, modelName: modelName, apiKey: apiKey, client: http.DefaultClient}
 }
 
 func (m *Model) Name() string { return m.modelName }
@@ -84,6 +85,8 @@ func (m *Model) GenerateContent(ctx context.Context, req *model.LLMRequest, _ bo
 			return
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		m.setAuth(httpReq)
+		httpReq.Header.Set("X-Urag-Source", "adk")
 
 		resp, err := m.client.Do(httpReq)
 		if err != nil {
@@ -128,6 +131,8 @@ func (m *Model) Generate(ctx context.Context, prompt string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	m.setAuth(req)
+	req.Header.Set("X-Urag-Source", "adk")
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("openaicompat: %w", err)
@@ -149,6 +154,13 @@ func (m *Model) Generate(ctx context.Context, prompt string) (string, error) {
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
+
+// setAuth adiciona o Bearer token ao request se o modelo tiver uma apiKey.
+func (m *Model) setAuth(req *http.Request) {
+	if m.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+m.apiKey)
+	}
+}
 
 type oaiMessage struct {
 	Role       string       `json:"role"`
