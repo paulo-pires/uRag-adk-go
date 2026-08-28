@@ -75,6 +75,37 @@ func (m *Model) GenerateContent(ctx context.Context, req *model.LLMRequest, _ bo
 				t := float64(*req.Config.Temperature)
 				payload.Temperature = &t
 			}
+			if req.Config.TopP != nil {
+				t := float64(*req.Config.TopP)
+				payload.TopP = &t
+			}
+			if req.Config.TopK != nil {
+				k := int(*req.Config.TopK)
+				payload.TopK = &k
+			}
+			if req.Config.MaxOutputTokens > 0 {
+				n := int(req.Config.MaxOutputTokens)
+				payload.MaxTokens = &n
+				payload.MaxCompletionTokens = &n
+			}
+			if req.Config.FrequencyPenalty != nil {
+				t := float64(*req.Config.FrequencyPenalty)
+				payload.FrequencyPenalty = &t
+			}
+			if req.Config.PresencePenalty != nil {
+				t := float64(*req.Config.PresencePenalty)
+				payload.PresencePenalty = &t
+			}
+			if req.Config.Seed != nil {
+				s := int(*req.Config.Seed)
+				payload.Seed = &s
+			}
+			if len(req.Config.StopSequences) > 0 {
+				payload.Stop = req.Config.StopSequences
+			}
+			if req.Config.ResponseMIMEType == "application/json" {
+				payload.ResponseFormat = json.RawMessage(`{"type":"json_object"}`)
+			}
 		}
 
 		body, _ := json.Marshal(payload)
@@ -189,11 +220,20 @@ type oaiTool struct {
 }
 
 type oaiRequest struct {
-	Model       string       `json:"model"`
-	Messages    []oaiMessage `json:"messages"`
-	Tools       []oaiTool    `json:"tools,omitempty"`
-	Stream      bool         `json:"stream"`
-	Temperature *float64     `json:"temperature,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []oaiMessage    `json:"messages"`
+	Tools               []oaiTool       `json:"tools,omitempty"`
+	Stream              bool            `json:"stream"`
+	Temperature         *float64        `json:"temperature,omitempty"`
+	TopP                *float64        `json:"top_p,omitempty"`
+	TopK                *int            `json:"top_k,omitempty"`
+	MaxTokens           *int            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	FrequencyPenalty    *float64        `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64        `json:"presence_penalty,omitempty"`
+	Seed                *int            `json:"seed,omitempty"`
+	Stop                any             `json:"stop,omitempty"`
+	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
 }
 
 type oaiChoice struct {

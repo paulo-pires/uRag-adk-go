@@ -11,6 +11,12 @@
 //	URAG_VECTOR_MEMORY    se "true", usa uRag-go como backend semântico de memória (D2)
 //	GUARD_URL             uRag-guard-go — vazio = reporte desligado
 //	GUARD_INGEST_TOKEN
+//	ML_GUARD_URL          urag-ml-guard — scan extra na escrita de memória (GAP-08)
+//	MEMORY_GATE_MODE      enforce (padrão) | warn | off
+//	MEMORY_REDACT_PII     default true
+//	MEMORY_TTL            default 720h (GAP-05)
+//	MEMORY_HALF_LIFE      default 168h
+//	MEMORY_MAX_ENTRIES    default 200
 //	MEMORY_DIR            diretório para memória por keyword (fallback se URAG_VECTOR_MEMORY não definido)
 //	AGENT_HTTP_ADDR       (default :8081)
 package main
@@ -84,16 +90,123 @@ func spanBufFromCtx(ctx context.Context) *spanBuffer {
 }
 
 type askArgs struct {
-	Question     string   `json:"question"`
-	SystemPrompt string   `json:"system_prompt,omitempty"`
-	SessionID    string   `json:"session_id,omitempty"`
-	UserID       string   `json:"user_id,omitempty"`
-	Temperature  *float64 `json:"temperature,omitempty"` // nil = model default; 0.0 = determinístico (pesquisa)
+	Question            string   `json:"question"`
+	SystemPrompt        string   `json:"system_prompt,omitempty"`
+	SessionID           string   `json:"session_id,omitempty"`
+	UserID              string   `json:"user_id,omitempty"`
+	Temperature         *float64 `json:"temperature,omitempty"`
+	TopP                *float64 `json:"top_p,omitempty"`
+	TopK                *float64 `json:"top_k,omitempty"`
+	MaxTokens           *int     `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int     `json:"max_completion_tokens,omitempty"`
+	FrequencyPenalty    *float64 `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64 `json:"presence_penalty,omitempty"`
+	Seed                *int     `json:"seed,omitempty"`
+	Stop                any      `json:"stop,omitempty"`
+	ReasoningEffort     string   `json:"reasoning_effort,omitempty"`
+	ResponseFormat      string   `json:"response_format,omitempty"`
+}
+
+func samplingToGenConfig(a askArgs) *genai.GenerateContentConfig {
+	cfg := &genai.GenerateContentConfig{}
+	used := false
+	if a.Temperature != nil {
+		t := float32(*a.Temperature)
+		cfg.Temperature = &t
+		used = true
+	}
+	if a.TopP != nil {
+		t := float32(*a.TopP)
+		cfg.TopP = &t
+		used = true
+	}
+	if a.TopK != nil {
+		t := float32(*a.TopK)
+		cfg.TopK = &t
+		used = true
+	}
+	maxTok := 0
+	if a.MaxCompletionTokens != nil && *a.MaxCompletionTokens > 0 {
+		maxTok = *a.MaxCompletionTokens
+	} else if a.MaxTokens != nil && *a.MaxTokens > 0 {
+		maxTok = *a.MaxTokens
+	}
+	if maxTok > 0 {
+		cfg.MaxOutputTokens = int32(maxTok)
+		used = true
+	}
+	if a.FrequencyPenalty != nil {
+		t := float32(*a.FrequencyPenalty)
+		cfg.FrequencyPenalty = &t
+		used = true
+	}
+	if a.PresencePenalty != nil {
+		t := float32(*a.PresencePenalty)
+		cfg.PresencePenalty = &t
+		used = true
+	}
+	if a.Seed != nil {
+		s := int32(*a.Seed)
+		cfg.Seed = &s
+		used = true
+	}
+	if stops := stopToStrings(a.Stop); len(stops) > 0 {
+		cfg.StopSequences = stops
+		used = true
+	}
+	if a.ResponseFormat == "json_object" || a.ResponseFormat == "json_schema" {
+		cfg.ResponseMIMEType = "application/json"
+		used = true
+	}
+	if !used {
+		return nil
+	}
+	return cfg
+}
+
+func stopToStrings(raw any) []string {
+	switch v := raw.(type) {
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return nil
+		}
+		if strings.HasPrefix(s, "[") {
+			var arr []string
+			if json.Unmarshal([]byte(s), &arr) == nil {
+				return arr
+			}
+		}
+		parts := strings.Split(s, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 type askOut struct {
-	Answer    string `json:"answer"`
-	SessionID string `json:"session_id"`
+	Answer        string `json:"answer"`
+	SessionID     string `json:"session_id"`
+	MemoryTokens  int    `json:"memory_tokens,omitempty"`
+	MemoryHits    int    `json:"memory_hits,omitempty"`
+	MemoryDropped int    `json:"memory_dropped,omitempty"`
 }
 
 // buildMemoryService retorna o backend de memória de acordo com as env vars:
@@ -102,13 +215,16 @@ type askOut struct {
 //	MEMORY_DIR definido     → FileService (keyword matching, legado)
 //	sem config              → InMemoryService do ADK (sem persistência)
 func buildMemoryService(mcpURL string) adkmemory.Service {
+	gate := filemem.NewGateFromEnv()
+	pol := filemem.PolicyFromEnv()
 	if os.Getenv("URAG_VECTOR_MEMORY") == "true" {
 		log.Printf("  Memory: VectorMemoryService (semântico) → %s", mcpURL)
-		return filemem.NewVectorService(mcpURL, os.Getenv("URAG_RAG_TOKEN"))
+		log.Printf("  Memory policy: ttl=%s half_life=%s max=%d", pol.TTL, pol.HalfLife, pol.MaxEntries)
+		return filemem.NewVectorService(mcpURL, os.Getenv("URAG_RAG_TOKEN")).WithGate(gate).WithPolicy(pol)
 	}
 	if dir := os.Getenv("MEMORY_DIR"); dir != "" {
 		log.Printf("  Memory: FileService (keyword) → %s", dir)
-		return filemem.New(dir)
+		return filemem.New(dir).WithGate(gate).WithPolicy(pol)
 	}
 	log.Printf("  Memory: InMemory (sem persistência)")
 	return adkmemory.InMemoryService()
@@ -198,19 +314,16 @@ func main() {
 	// Callbacks lêem spanbuf e instruction do context — sem estado per-call no runner.
 	var runnerCache sync.Map // string → *runner.Runner
 
-	buildOrGetRunner := func(temperature *float64) (*runner.Runner, error) {
+	buildOrGetRunner := func(args askArgs) (*runner.Runner, error) {
+		cfg := samplingToGenConfig(args)
 		key := "nil"
-		if temperature != nil {
-			key = fmt.Sprintf("%g", *temperature)
+		if cfg != nil {
+			if b, err := json.Marshal(cfg); err == nil {
+				key = string(b)
+			}
 		}
 		if cached, ok := runnerCache.Load(key); ok {
 			return cached.(*runner.Runner), nil
-		}
-
-		var genCfg *genai.GenerateContentConfig
-		if temperature != nil {
-			t := float32(*temperature)
-			genCfg = &genai.GenerateContentConfig{Temperature: &t}
 		}
 
 		a, err := llmagent.New(llmagent.Config{
@@ -219,7 +332,7 @@ func main() {
 			Description:           "uRag ADK agent.",
 			Instruction:           "You are a helpful assistant with access to uRag knowledge base tools. Use them to answer questions.",
 			Toolsets:              toolsets,
-			GenerateContentConfig: genCfg,
+			GenerateContentConfig: cfg,
 			BeforeToolCallbacks: []llmagent.BeforeToolCallback{
 				func(ctx adkagent.Context, t tool.Tool, args map[string]any) (map[string]any, error) {
 					if sb := spanBufFromCtx(ctx); sb != nil {
@@ -363,7 +476,7 @@ func main() {
 					UserID:  userID,
 					Query:   args.Question,
 				})
-				if len(memResp.Memories) > 0 {
+				if memResp != nil && len(memResp.Memories) > 0 {
 					msgPrefix.WriteString("<past_context>\n")
 					for _, m := range memResp.Memories {
 						for _, p := range m.Content.Parts {
@@ -376,13 +489,17 @@ func main() {
 					msgPrefix.WriteString("</past_context>\n")
 				}
 			}
+			var memStats filemem.SearchStats
+			if inst, ok := memSvc.(filemem.Instrumented); ok {
+				memStats = inst.TakeLastSearch()
+			}
 			question := args.Question
 			if msgPrefix.Len() > 0 {
 				question = msgPrefix.String() + question
 			}
 
 			spanbuf := newSpanBuffer()
-			r, err := buildOrGetRunner(args.Temperature)
+			r, err := buildOrGetRunner(args)
 			if err != nil {
 				return nil, askOut{}, err
 			}
@@ -459,6 +576,37 @@ func main() {
 				TokensOut: acc.Out,
 			})
 
+			if runID != "" && memStats.TotalTokens() > 0 {
+				gc.PushSpan(guard.SpanInput{
+					RunID:    runID,
+					ToolName: "search_memory",
+					Args: map[string]any{
+						"query_tokens":  memStats.QueryTokens,
+						"result_tokens": memStats.ResultTokens,
+						"hits":          memStats.Hits,
+						"dropped":       memStats.Dropped,
+						"memory_ids":    memStats.MemoryIDs,
+					},
+					Result:    map[string]any{"tokens": memStats.TotalTokens()},
+					StartedAt: startedAt,
+					EndedAt:   startedAt.Add(memStats.Latency),
+				})
+			}
+
+			spanbuf.mu.Lock()
+			spans := append([]spanEntry(nil), spanbuf.spans...)
+			spanbuf.mu.Unlock()
+			toolOK := false
+			for _, sp := range spans {
+				if sp.errStr == "" {
+					toolOK = true
+					break
+				}
+			}
+			if inst, ok := memSvc.(filemem.Instrumented); ok {
+				inst.Credit(memStats.MemoryIDs, toolOK && len(spans) > 0)
+			}
+
 			// ── registrar eventos de guardrail ────────────────────────────────
 			for _, v := range inputViolations { // flags que não bloquearam
 				gc.PushGuardrailEvent(runID, v.rule.ID, v.rule.Name, "input", "flag", v.snippet)
@@ -469,9 +617,6 @@ func main() {
 
 			// ── spans de tool calls (batch: uma goroutine por run) ───────────
 			if runID != "" {
-				spanbuf.mu.Lock()
-				spans := spanbuf.spans
-				spanbuf.mu.Unlock()
 				if len(spans) > 0 {
 					go func() {
 						for _, sp := range spans {
@@ -501,7 +646,13 @@ func main() {
 				}
 			}
 
-			return nil, askOut{Answer: answer, SessionID: returnSessionID}, nil
+			return nil, askOut{
+				Answer:        answer,
+				SessionID:     returnSessionID,
+				MemoryTokens:  memStats.TotalTokens(),
+				MemoryHits:    memStats.Hits,
+				MemoryDropped: memStats.Dropped,
+			}, nil
 		},
 	)
 
@@ -554,7 +705,7 @@ func main() {
 		}
 
 		spanbuf := newSpanBuffer()
-		r, err := buildOrGetRunner(nil)
+		r, err := buildOrGetRunner(askArgs{})
 		if err != nil {
 			return "", "", err
 		}

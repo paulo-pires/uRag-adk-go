@@ -21,28 +21,43 @@ import (
 
 // FileService é um memory.Service persistido em JSONL por usuário.
 type FileService struct {
-	dir string
+	dir    string
+	gate   *Gate
+	policy Policy
+	stats  statsSlot
 
 	mu    sync.RWMutex
-	cache map[cacheKey][]entry // carregado sob demanda, nunca invalidado
+	cache map[cacheKey][]entry
 }
 
 type cacheKey struct{ appName, userID string }
 
 type entry struct {
-	ID        string    `json:"id"`
-	Author    string    `json:"author"`
-	Timestamp time.Time `json:"timestamp"`
-	Text      string    `json:"text"` // texto plano extraído do Content
-	words     map[string]struct{}
+	ID         string    `json:"id"`
+	Author     string    `json:"author"`
+	Timestamp  time.Time `json:"timestamp"`
+	LastAccess time.Time `json:"last_access"`
+	Hits       int       `json:"hits"`
+	Text       string    `json:"text"`
+	words      map[string]struct{}
 }
 
-// New cria um FileService que armazena memórias em dir.
 func New(dir string) *FileService {
 	return &FileService{
-		dir:   dir,
-		cache: make(map[cacheKey][]entry),
+		dir:    dir,
+		cache:  make(map[cacheKey][]entry),
+		policy: DefaultPolicy(),
 	}
+}
+
+func (s *FileService) WithGate(g *Gate) *FileService {
+	s.gate = g
+	return s
+}
+
+func (s *FileService) WithPolicy(p Policy) *FileService {
+	s.policy = p
+	return s
 }
 
 // AddSessionToMemory extrai respostas LLM da sessão e persiste em JSONL.
@@ -62,73 +77,179 @@ func (s *FileService) AddSessionToMemory(ctx context.Context, sess session.Sessi
 		if t == "" {
 			continue
 		}
+		if s.gate != nil {
+			filtered, allow, _ := s.gate.FilterForStore(ctx, t)
+			if !allow {
+				continue
+			}
+			t = filtered
+		}
 		newEntries = append(newEntries, entry{
-			ID:        ev.ID,
-			Author:    ev.Author,
-			Timestamp: ev.Timestamp,
-			Text:      t,
-			words:     extractWords(t),
+			ID:         ev.ID,
+			Author:     ev.Author,
+			Timestamp:  ev.Timestamp,
+			LastAccess: time.Now().UTC(),
+			Hits:       0,
+			Text:       t,
+			words:      extractWords(t),
 		})
 	}
 	if len(newEntries) == 0 {
 		return nil
 	}
 
-	path := s.filePath(sess.AppName(), sess.UserID())
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	for _, e := range newEntries {
-		if err := enc.Encode(e); err != nil {
-			return err
-		}
-	}
-
 	k := cacheKey{sess.AppName(), sess.UserID()}
 	s.mu.Lock()
+	if _, ok := s.cache[k]; !ok {
+		loaded, _ := s.load(sess.AppName(), sess.UserID())
+		s.cache[k] = loaded
+	}
 	s.cache[k] = append(s.cache[k], newEntries...)
+	pruned := s.pruneLocked(k)
 	s.mu.Unlock()
-	return nil
+	return s.rewrite(sess.AppName(), sess.UserID(), pruned)
 }
 
 // SearchMemory faz keyword matching sobre as memórias do usuário.
 func (s *FileService) SearchMemory(ctx context.Context, req *adkmemory.SearchRequest) (*adkmemory.SearchResponse, error) {
 	k := cacheKey{req.AppName, req.UserID}
-
-	s.mu.RLock()
-	entries, loaded := s.cache[k]
-	s.mu.RUnlock()
-
-	if !loaded {
-		loaded2, err := s.load(req.AppName, req.UserID)
-		if err != nil {
-			return &adkmemory.SearchResponse{}, nil //nolint:nilerr — best-effort
-		}
-		s.mu.Lock()
-		s.cache[k] = loaded2
-		s.mu.Unlock()
-		entries = loaded2
-	}
-
+	started := time.Now()
 	queryWords := extractWords(req.Query)
-	resp := &adkmemory.SearchResponse{}
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	if _, ok := s.cache[k]; !ok {
+		loaded, err := s.load(req.AppName, req.UserID)
+		if err != nil {
+			s.mu.Unlock()
+			return &adkmemory.SearchResponse{}, nil
+		}
+		s.cache[k] = loaded
+	}
+	entries := s.cache[k]
+	dropped := 0
+	var surviving []entry
 	for _, e := range entries {
-		if intersects(e.words, queryWords) {
-			resp.Memories = append(resp.Memories, adkmemory.Entry{
-				ID:        e.ID,
-				Author:    e.Author,
-				Timestamp: e.Timestamp,
-				Content:   &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{genai.NewPartFromText(e.Text)}},
-			})
+		la := e.LastAccess
+		if la.IsZero() {
+			la = e.Timestamp
+		}
+		age := now.Sub(la)
+		if s.policy.TTL > 0 && age > s.policy.TTL {
+			dropped++
+			continue
+		}
+		ds := DecayScore(age, e.Hits, s.policy.HalfLife)
+		if e.Hits == 0 && s.policy.MinScore > 0 && ds < s.policy.MinScore {
+			dropped++
+			continue
+		}
+		surviving = append(surviving, e)
+	}
+
+	resp := &adkmemory.SearchResponse{}
+	var ids []string
+	resultTokens := 0
+	for i := range surviving {
+		e := surviving[i]
+		if s.gate != nil && !s.gate.FilterForRecall(ctx, e.Text) {
+			dropped++
+			continue
+		}
+		if !intersects(e.words, queryWords) {
+			continue
+		}
+		surviving[i].LastAccess = now
+		ids = append(ids, e.ID)
+		resultTokens += EstimateTokens(e.Text)
+		resp.Memories = append(resp.Memories, adkmemory.Entry{
+			ID:        e.ID,
+			Author:    e.Author,
+			Timestamp: e.Timestamp,
+			Content:   &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{genai.NewPartFromText(e.Text)}},
+		})
+	}
+	s.cache[k] = surviving
+	s.mu.Unlock()
+
+	s.stats.store(SearchStats{
+		QueryTokens:  EstimateTokens(req.Query),
+		ResultTokens: resultTokens,
+		Hits:         len(ids),
+		Dropped:      dropped,
+		MemoryIDs:    ids,
+		Latency:      time.Since(started),
+	})
+	return resp, nil
+}
+
+func (s *FileService) TakeLastSearch() SearchStats { return s.stats.take() }
+
+func (s *FileService) Credit(ids []string, success bool) {
+	if !success || len(ids) == 0 {
+		return
+	}
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	s.mu.Lock()
+	now := time.Now().UTC()
+	for k, entries := range s.cache {
+		for i := range entries {
+			if want[entries[i].ID] {
+				entries[i].Hits++
+				entries[i].LastAccess = now
+			}
+		}
+		s.cache[k] = entries
+	}
+	s.mu.Unlock()
+}
+
+func (s *FileService) pruneLocked(k cacheKey) []entry {
+	entries := s.cache[k]
+	now := time.Now().UTC()
+	items := make([]Item, 0, len(entries))
+	byID := map[string]entry{}
+	for _, e := range entries {
+		la := e.LastAccess
+		if la.IsZero() {
+			la = e.Timestamp
+		}
+		byID[e.ID] = e
+		items = append(items, Item{ID: e.ID, LastAccess: la, Hits: e.Hits})
+	}
+	kept := SelectKept(items, now, s.policy)
+	out := make([]entry, 0, len(kept))
+	for _, it := range kept {
+		out = append(out, byID[it.ID])
+	}
+	s.cache[k] = out
+	return out
+}
+
+func (s *FileService) rewrite(appName, userID string, entries []entry) error {
+	path := s.filePath(appName, userID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	for _, e := range entries {
+		if err := enc.Encode(e); err != nil {
+			f.Close()
+			return err
 		}
 	}
-	return resp, nil
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (s *FileService) load(appName, userID string) ([]entry, error) {

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"urag-adk-go/pkg/copilots"
 
@@ -18,6 +19,33 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
+
+// maxAgentInputLen limita o tamanho da mensagem de entrada do usuário (Grupo L / L3).
+const maxAgentInputLen = 16000
+
+// sanitizeAgentInput trunca e remove caracteres de controle/zero-width da entrada
+// do usuário antes de enviá-la ao agente, mitigando injeção de prompt oculta.
+func sanitizeAgentInput(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\t', '\r':
+			return r
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		switch r {
+		case '​', '‌', '‍', '‎', '‏', '‐', '�':
+			return -1
+		}
+		return r
+	}, s)
+	if len([]rune(s)) > maxAgentInputLen {
+		runes := []rune(s)
+		s = string(runes[:maxAgentInputLen])
+	}
+	return s
+}
 
 // ── DB ────────────────────────────────────────────────────────────────────────
 
@@ -389,6 +417,10 @@ func handleCopilotChat(w http.ResponseWriter, r *http.Request) {
 		copilotErrResp(w, "message é obrigatório", http.StatusBadRequest)
 		return
 	}
+
+	// Grupo L / L3: restringir tamanho e caracteres da entrada do usuário antes
+	// de repassá-la ao agente, evitando injeção de prompt via controle/zero-width.
+	body.Message = sanitizeAgentInput(body.Message)
 
 	if runAgentFunc == nil {
 		copilotErrResp(w, "agente não disponível", http.StatusServiceUnavailable)
