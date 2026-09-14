@@ -42,14 +42,28 @@ func accFromCtx(ctx context.Context) *UsageAccumulator {
 }
 
 type Model struct {
-	baseURL   string // e.g. "http://localhost:1234/v1"
-	modelName string // passed as "model" field; LM Studio accepts whatever is loaded
-	apiKey    string // Bearer token para o proxy (vazio = sem auth)
-	client    *http.Client
+	baseURL        string // e.g. "http://localhost:1234/v1"
+	modelName      string // passed as "model" field; LM Studio accepts whatever is loaded
+	apiKey         string // Bearer token para o proxy (vazio = sem auth)
+	providerHeader string // X-Urag-Provider value (e.g. "opencode-go"); vazio = omite header
+	client         *http.Client
 }
 
 func New(baseURL, modelName, apiKey string) *Model {
 	return &Model{baseURL: baseURL, modelName: modelName, apiKey: apiKey, client: http.DefaultClient}
+}
+
+// NewWithProvider cria um Model com X-Urag-Provider header configurado.
+// Necessário para rotear corretamente via urag_proxy (sem o header o proxy
+// cai no openrouter, que não tem deepseek-v4-flash).
+func NewWithProvider(baseURL, modelName, apiKey, providerHeader string) *Model {
+	return &Model{
+		baseURL:        baseURL,
+		modelName:      modelName,
+		apiKey:         apiKey,
+		providerHeader: providerHeader,
+		client:         http.DefaultClient,
+	}
 }
 
 func (m *Model) Name() string { return m.modelName }
@@ -146,7 +160,12 @@ func (m *Model) GenerateContent(ctx context.Context, req *model.LLMRequest, _ bo
 		if acc := accFromCtx(ctx); acc != nil {
 			acc.add(result.Usage.PromptTokens, result.Usage.CompletionTokens)
 		}
-		yield(oaiToLLMResponse(result.Choices[0]), nil)
+		llmResp, convErr := oaiToLLMResponse(result.Choices[0])
+		if convErr != nil {
+			yield(nil, convErr)
+			return
+		}
+		yield(llmResp, nil)
 	}
 }
 
@@ -186,10 +205,15 @@ func (m *Model) Generate(ctx context.Context, prompt string) (string, error) {
 
 // ── wire types ───────────────────────────────────────────────────────────────
 
-// setAuth adiciona o Bearer token ao request se o modelo tiver uma apiKey.
+// setAuth adiciona o Bearer token e o header X-Urag-Provider (se configurado).
+// O header X-Urag-Provider é necessário para rotear via urag_proxy; sem ele o
+// proxy cai no openrouter-default, que não tem deepseek-v4-flash.
 func (m *Model) setAuth(req *http.Request) {
 	if m.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+m.apiKey)
+	}
+	if m.providerHeader != "" {
+		req.Header.Set("X-Urag-Provider", m.providerHeader)
 	}
 }
 
@@ -317,7 +341,7 @@ func toolsToOAI(tools []*genai.Tool) []oaiTool {
 	return out
 }
 
-func oaiToLLMResponse(choice oaiChoice) *model.LLMResponse {
+func oaiToLLMResponse(choice oaiChoice) (*model.LLMResponse, error) {
 	msg := choice.Message
 	var parts []*genai.Part
 
@@ -335,6 +359,11 @@ func oaiToLLMResponse(choice oaiChoice) *model.LLMResponse {
 		}
 	} else if msg.Content != "" {
 		parts = append(parts, genai.NewPartFromText(msg.Content))
+	} else {
+		// Modelo retornou sem content e sem tool calls.
+		// Causa provável: max_tokens insuficiente (finish_reason=length).
+		// Raciocínio não é substituto de código — falha alto para o caller corrigir.
+		return nil, fmt.Errorf("openaicompat: model returned empty content (finish_reason=%q); increase max_tokens", choice.FinishReason)
 	}
 
 	finishReason := genai.FinishReasonStop
@@ -346,7 +375,7 @@ func oaiToLLMResponse(choice oaiChoice) *model.LLMResponse {
 		Content:      &genai.Content{Role: genai.RoleModel, Parts: parts},
 		TurnComplete: true,
 		FinishReason: finishReason,
-	}
+	}, nil
 }
 
 func schemaToJSON(s *genai.Schema) map[string]any {
