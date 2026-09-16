@@ -36,7 +36,32 @@ type runResult struct {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Prompt inicial quebrado — mesmo para os dois braços
+// cenario descreve um caso de teste: conjunto de arquivos quebrados + prompt.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type cenario struct {
+	// nome identifica o cenário nos logs e no MEDICAO.md
+	nome string
+
+	// arquivos é o mapa de caminho relativo → conteúdo que será escrito no
+	// sandbox antes de o agente começar (o estado "quebrado" de partida).
+	arquivos map[string]string
+
+	// prompt é o texto enviado ao agente para arrancar o laço de correção.
+	prompt string
+}
+
+// parBracosResultado agrupa os resultados dos dois braços de um cenário.
+type parBracosResultado struct {
+	bracoA []runResult
+	bracoB []runResult
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cenário 1 — "import-faltando"
+// Um componente usa <Calendar /> sem importar Calendar de lucide-react.
+// O erro aparece só em App.tsx e é visível relendo o arquivo.
+// (Cenário original; mantido para continuidade histórica.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const brokenAppTSX = `import React from 'react';
@@ -54,15 +79,90 @@ export function App() {
 export default App;
 `
 
-// O agente recebe este prompt para CORRIGIR o arquivo já quebrado.
-// (A intenção é medir se o diagnóstico do compilador ajuda na correção.)
-const measurePrompt = `O arquivo src/App.tsx já existe no workspace com um erro de compilação.
+const promptImportFaltando = `O arquivo src/App.tsx já existe no workspace com um erro de compilação.
 Sua tarefa:
 1. Chame compilar para ver o erro.
 2. Corrija o arquivo usando escrever_arquivos.
 3. Chame compilar novamente até obter sucesso.
 4. Quando compilar retornar ok:true, chame exit_loop.
 `
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cenário 2 — "erro-entre-arquivos"
+//
+// O erro está distribuído entre dois arquivos:
+//   - src/types.ts  — declara CardProps e emite emptyCard() sem preencher 'total'
+//   - src/App.tsx   — usa CardProps e passa total como string em vez de number
+//
+// Lendo apenas App.tsx não dá para saber qual lado está errado:
+//
+//	o componente pode estar passando o tipo errado, OU a interface pode estar
+//	incompleta. O tsc aponta as duas linhas em arquivos distintos; isso é
+//	exatamente a informação que o braço B (sem diagnóstico) não recebe.
+//
+// Prova: CENARIO-2-PROVA.txt — saída real do tsc antes de qualquer rodada.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const brokenTypesTS = `export interface CardProps {
+  titulo: string;
+  total: number;
+}
+
+// ERRO INTENCIONAL: função afirma retornar CardProps mas omite campo 'total'
+export function emptyCard(): CardProps {
+  return { titulo: '' };
+}
+`
+
+const brokenAppTSXCenario2 = `import React from 'react';
+import { CardProps, emptyCard } from './types';
+
+function Dashboard({ titulo, total }: CardProps) {
+  return <div className="p-4">{titulo}: {total}</div>;
+}
+
+export function App() {
+  const card = emptyCard();
+  // ERRO INTENCIONAL: total deveria ser number, mas passamos string
+  return <Dashboard titulo={card.titulo} total={"cem"} />;
+}
+
+export default App;
+`
+
+const promptErroBetweenFiles = `Os arquivos src/types.ts e src/App.tsx já existem no workspace com erros de compilação.
+Sua tarefa:
+1. Chame compilar para ver os erros.
+2. Analise os diagnósticos: os erros podem estar em App.tsx, em types.ts, ou em ambos.
+3. Corrija os arquivos necessários usando escrever_arquivos.
+4. Chame compilar novamente até obter sucesso.
+5. Quando compilar retornar ok:true, chame exit_loop.
+`
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lista de cenários a medir
+// ─────────────────────────────────────────────────────────────────────────────
+
+var todosCenarios = []cenario{
+	{
+		nome: "import-faltando",
+		arquivos: map[string]string{
+			"src/App.tsx": brokenAppTSX,
+		},
+		prompt: promptImportFaltando,
+	},
+	{
+		nome: "erro-entre-arquivos",
+		arquivos: map[string]string{
+			"src/types.ts": brokenTypesTS,
+			"src/App.tsx":  brokenAppTSXCenario2,
+		},
+		prompt: promptErroBetweenFiles,
+	},
+}
+
+// measurePrompt é mantido por compatibilidade com referências externas.
+const measurePrompt = promptImportFaltando
 
 // ─────────────────────────────────────────────────────────────────────────────
 // runBraco executa N rodadas de um braço (com ou sem diagnóstico detalhado)
@@ -104,7 +204,7 @@ func (s *sandboxDiagBraco) Compile(ctx context.Context) (*BuildResult, error) {
 	return res, nil
 }
 
-func executarRodada(ctx context.Context, b braco, n int) (runResult, error) {
+func executarRodada(ctx context.Context, b braco, c cenario, n int) (runResult, error) {
 	// Cada rodada tem seu próprio sandbox (estado limpo)
 	sbCfg := DefaultSandboxConfig(b.templateDir)
 	sbCfg.UseDocker = true
@@ -114,10 +214,8 @@ func executarRodada(ctx context.Context, b braco, n int) (runResult, error) {
 	}
 	defer rawSb.Close()
 
-	// Escreve o app quebrado de partida
-	if err := rawSb.WriteFiles(map[string]string{
-		"src/App.tsx": brokenAppTSX,
-	}); err != nil {
+	// Escreve os arquivos quebrados do cenário
+	if err := rawSb.WriteFiles(c.arquivos); err != nil {
 		return runResult{}, fmt.Errorf("rodada %d: WriteFiles: %w", n, err)
 	}
 
@@ -127,7 +225,7 @@ func executarRodada(ctx context.Context, b braco, n int) (runResult, error) {
 	acc := &openaicompat.UsageAccumulator{}
 	ctx = openaicompat.WithUsageAccumulator(ctx, acc)
 
-	// Contador HTTP (compartilhado por todos no braço)
+	// Contador de chamadas a compilar nesta rodada
 	compileCallCount := 0
 
 	// Ferramentas
@@ -201,7 +299,7 @@ func executarRodada(ctx context.Context, b braco, n int) (runResult, error) {
 	}
 
 	builderAgent, err := llmagent.New(llmagent.Config{
-		Name:        fmt.Sprintf("forge_builder_%s_%d", b.nome, n),
+		Name:        fmt.Sprintf("forge_builder_%s_%s_%d", b.nome, c.nome, n),
 		Model:       b.modelo,
 		Description: "Forge builder agent",
 		Instruction: ForgeBuilderInstruction,
@@ -216,7 +314,7 @@ func executarRodada(ctx context.Context, b braco, n int) (runResult, error) {
 
 	loopAg, err := loopagent.New(loopagent.Config{
 		AgentConfig: agent.Config{
-			Name:        fmt.Sprintf("forge_loop_%s_%d", b.nome, n),
+			Name:        fmt.Sprintf("forge_loop_%s_%s_%d", b.nome, c.nome, n),
 			Description: "LoopAgent forge measure",
 			SubAgents:   []agent.Agent{builderAgent},
 		},
@@ -236,7 +334,7 @@ func executarRodada(ctx context.Context, b braco, n int) (runResult, error) {
 		return runResult{}, fmt.Errorf("rodada %d: runner: %w", n, err)
 	}
 
-	sessID := fmt.Sprintf("measure-%s-%d-%d", b.nome, n, time.Now().UnixNano())
+	sessID := fmt.Sprintf("measure-%s-%s-%d-%d", b.nome, c.nome, n, time.Now().UnixNano())
 	_, _ = sessSvc.Create(ctx, &session.CreateRequest{
 		AppName:   "urag-forge-measure",
 		UserID:    "measure-user",
@@ -244,7 +342,7 @@ func executarRodada(ctx context.Context, b braco, n int) (runResult, error) {
 	})
 
 	start := time.Now()
-	msg := genai.NewContentFromText(measurePrompt, genai.RoleUser)
+	msg := genai.NewContentFromText(c.prompt, genai.RoleUser)
 	for _, err := range r.Run(ctx, "measure-user", sessID, msg, agent.RunConfig{}) {
 		if err != nil {
 			// Erro do laço (ex: modelo retornou vazio) — contamos como falha desta rodada
@@ -332,151 +430,122 @@ func TestForge_MeasureConvergenceWithVsWithoutDiagnostics(t *testing.T) {
 	t.Logf("Modelo: %s via %s (provider=%s)", modelName, proxyURL, provider)
 	t.Logf("Template: %s", templateDir)
 	t.Logf("N=%d rodadas por braço, maxIter=%d", N, maxIter)
+	t.Logf("Cenários: %d (%s)", len(todosCenarios), cenarioNomes())
 	t.Logf("Início: %s", time.Now().UTC().Format(time.RFC3339))
 
-	type bracoResult struct {
-		nome       string
-		resultados []runResult
-		httpTokens int64
-	}
+	resultadosPorCenario := make([]parBracosResultado, len(todosCenarios))
 
-	runBraco := func(nome string, comDiag bool) *bracoResult {
-		br := &bracoResult{nome: nome}
+	for ci, cen := range todosCenarios {
+		t.Logf("\n═══════════════════════════════════════")
+		t.Logf("CENÁRIO %d/%d: %s", ci+1, len(todosCenarios), cen.nome)
+		t.Logf("═══════════════════════════════════════")
 
-		httpTokens := int64(0)
-		var httpMu sync.Mutex
+		runBraco := func(nomeBraco string, comDiag bool) []runResult {
+			var resultados []runResult
 
-		modelo := openaicompat.NewWithProvider(proxyURL, modelName, apiKey, provider)
+			httpTokens := int64(0)
+			var httpMu sync.Mutex
 
-		b := braco{
-			nome:        nome,
-			comDiag:     comDiag,
-			modelo:      modelo,
-			templateDir: templateDir,
-			maxIter:     maxIter,
-			httpCounter: &httpTokens,
-			counterMu:   &httpMu,
-		}
+			modelo := openaicompat.NewWithProvider(proxyURL, modelName, apiKey, provider)
 
-		for i := 0; i < N; i++ {
-			t.Logf("[%s] Rodada %d/%d ...", nome, i+1, N)
-			res, err := executarRodada(context.Background(), b, i+1)
-			if err != nil {
-				t.Logf("[%s] Rodada %d ERRO: %v", nome, i+1, err)
-				res = runResult{Success: false, CompilationIter: 0}
+			b := braco{
+				nome:        nomeBraco,
+				comDiag:     comDiag,
+				modelo:      modelo,
+				templateDir: templateDir,
+				maxIter:     maxIter,
+				httpCounter: &httpTokens,
+				counterMu:   &httpMu,
 			}
-			br.resultados = append(br.resultados, res)
-			t.Logf("[%s] Rodada %d: sucesso=%v iter=%d dur=%s tokIn=%d tokOut=%d",
-				nome, i+1, res.Success, res.CompilationIter, res.Duration.Round(time.Millisecond),
-				res.TokensIn, res.TokensOut)
+
+			for i := 0; i < N; i++ {
+				t.Logf("[%s/%s] Rodada %d/%d ...", cen.nome, nomeBraco, i+1, N)
+				res, err := executarRodada(context.Background(), b, cen, i+1)
+				if err != nil {
+					t.Logf("[%s/%s] Rodada %d ERRO: %v", cen.nome, nomeBraco, i+1, err)
+					res = runResult{Success: false, CompilationIter: 0}
+				}
+				resultados = append(resultados, res)
+				t.Logf("[%s/%s] Rodada %d: sucesso=%v iter=%d dur=%s tokIn=%d tokOut=%d",
+					cen.nome, nomeBraco, i+1, res.Success, res.CompilationIter, res.Duration.Round(time.Millisecond),
+					res.TokensIn, res.TokensOut)
+			}
+
+			return resultados
 		}
 
-		br.httpTokens = httpTokens
-		return br
-	}
+		t.Logf("\n--- Executando Braço A (com diagnóstico real) ---")
+		resA := runBraco("A-com-diag", true)
 
-	t.Logf("\n--- Executando Braço A (com diagnóstico real) ---")
-	bracoA := runBraco("A-com-diag", true)
+		t.Logf("\n--- Executando Braço B (sem diagnóstico, mensagem genérica) ---")
+		resB := runBraco("B-sem-diag", false)
 
-	t.Logf("\n--- Executando Braço B (sem diagnóstico, mensagem genérica) ---")
-	bracoB := runBraco("B-sem-diag", false)
+		resultadosPorCenario[ci] = parBracosResultado{bracoA: resA, bracoB: resB}
 
-	// ── Calcula métricas ──────────────────────────────────────────────────────
+		// ── Calcula e exibe métricas por cenário ──────────────────────────────
 
-	computeMetrics := func(resultados []runResult) (successRate float64, dist map[int]int, failIn4 int, avgDur time.Duration, tokIn, tokOut int64) {
-		dist = map[int]int{1: 0, 2: 0, 3: 0, 4: 0}
-		var totalDur time.Duration
-		for _, r := range resultados {
-			if r.Success {
-				key := r.CompilationIter
-				if key < 1 {
-					key = 1
-				}
-				if key > 4 {
-					key = 4
-				}
-				dist[key]++
+		srA, distA, failA, avgDurA, tokInA, tokOutA := computeMetrics(resA)
+		srB, distB, failB, avgDurB, tokInB, tokOutB := computeMetrics(resB)
+
+		const costPerMIn = 0.27 / 1_000_000
+		const costPerMOut = 1.10 / 1_000_000
+		costA := float64(tokInA)*costPerMIn + float64(tokOutA)*costPerMOut
+		costB := float64(tokInB)*costPerMIn + float64(tokOutB)*costPerMOut
+
+		t.Logf("\n══════════════════════════════════════════════════")
+		t.Logf("RESULTADOS CENÁRIO [%s] — %s", cen.nome, time.Now().UTC().Format(time.RFC3339))
+		t.Logf("══════════════════════════════════════════════════")
+		t.Logf("Modelo: %s | N=%d por braço | maxIter=%d", modelName, N, maxIter)
+		t.Logf("")
+		t.Logf("BRAÇO A (com diagnóstico real do compilador):")
+		t.Logf("  Taxa de sucesso:             %.1f%% (%d/%d)", srA*100, N-failA, N)
+		t.Logf("  Falhou em 4 tentativas:      %d (%.1f%%)", failA, float64(failA)/float64(N)*100)
+		t.Logf("  Distribuição de iterações:   1=%d 2=%d 3=%d 4=%d", distA[1], distA[2], distA[3], distA[4])
+		t.Logf("  Duração média por rodada:    %s", avgDurA.Round(time.Millisecond))
+		t.Logf("  Tokens: in=%d out=%d | Custo estimado: $%.5f", tokInA, tokOutA, costA)
+		t.Logf("")
+		t.Logf("BRAÇO B (sem diagnóstico — 'Build failed. Try again.'):")
+		t.Logf("  Taxa de sucesso:             %.1f%% (%d/%d)", srB*100, N-failB, N)
+		t.Logf("  Falhou em 4 tentativas:      %d (%.1f%%)", failB, float64(failB)/float64(N)*100)
+		t.Logf("  Distribuição de iterações:   1=%d 2=%d 3=%d 4=%d", distB[1], distB[2], distB[3], distB[4])
+		t.Logf("  Duração média por rodada:    %s", avgDurB.Round(time.Millisecond))
+		t.Logf("  Tokens: in=%d out=%d | Custo estimado: $%.5f", tokInB, tokOutB, costB)
+		t.Logf("")
+
+		diff := srA - srB
+		switch {
+		case diff > 0.10:
+			t.Logf("CONCLUSÃO [%s]: Diagnóstico ajuda — Braço A %.1f pp melhor que B.", cen.nome, diff*100)
+		case diff < -0.10:
+			t.Logf("CONCLUSÃO [%s]: Surpreendente — Braço B %.1f pp melhor que A (sem diagnóstico).", cen.nome, -diff*100)
+		default:
+			t.Logf("CONCLUSÃO [%s]: sem diferença na TAXA DE SUCESSO (diff=%.1f pp).", cen.nome, diff*100)
+			// Empate na taxa de sucesso NÃO significa que o laço está quebrado. Se
+			// todas as rodadas dos dois braços convergirem no mesmo número de
+			// iterações, o que a medição mostrou é que o CASO DE TESTE não
+			// discrimina — e concluir "o laço não funciona" a partir disso é ler o
+			// experimento ao contrário. Foi o que a primeira versão fazia.
+			if degenerada(distA) && degenerada(distB) {
+				t.Logf("  → ATENÇÃO: distribuição degenerada — todas as rodadas dos DOIS braços")
+				t.Logf("    convergiram no mesmo número de iterações. O caso de teste não")
+				t.Logf("    discrimina: o modelo resolve sem precisar do diagnóstico.")
+				t.Logf("    Isto NÃO é evidência de que o laço falhou; é evidência de que o")
+				t.Logf("    caso é fácil demais. Use um erro que não se veja relendo o arquivo.")
 			} else {
-				failIn4++
+				t.Logf("  → O diagnóstico não mudou o acerto neste caso. Compare o custo abaixo.")
 			}
-			totalDur += r.Duration
-			tokIn += r.TokensIn
-			tokOut += r.TokensOut
 		}
-		successRate = float64(len(resultados)-failIn4) / float64(len(resultados))
-		if len(resultados) > 0 {
-			avgDur = totalDur / time.Duration(len(resultados))
+		// O custo é a outra metade da resposta, e some se só se olhar acerto.
+		if tokInA > 0 && tokOutA > 0 {
+			t.Logf("CUSTO: B gasta %.0f%% mais tokens de entrada e %.0f%% mais de saída que A.",
+				100*(float64(tokInB)/float64(tokInA)-1), 100*(float64(tokOutB)/float64(tokOutA)-1))
 		}
-		return
+		t.Logf("══════════════════════════════════════════════════")
 	}
 
-	srA, distA, failA, avgDurA, tokInA, tokOutA := computeMetrics(bracoA.resultados)
-	srB, distB, failB, avgDurB, tokInB, tokOutB := computeMetrics(bracoB.resultados)
+	// ── Grava MEDICAO.md com resultados por cenário ───────────────────────────
 
-	// Custo estimado: deepseek-v4-flash ≈ $0.27/M input, $1.10/M output (valores de referência)
-	const costPerMIn = 0.27 / 1_000_000
-	const costPerMOut = 1.10 / 1_000_000
-	costA := float64(tokInA)*costPerMIn + float64(tokOutA)*costPerMOut
-	costB := float64(tokInB)*costPerMIn + float64(tokOutB)*costPerMOut
-
-	// ── Reporta ───────────────────────────────────────────────────────────────
-
-	t.Logf("\n══════════════════════════════════════════════════")
-	t.Logf("RESULTADOS — %s", time.Now().UTC().Format(time.RFC3339))
-	t.Logf("══════════════════════════════════════════════════")
-	t.Logf("Modelo: %s | N=%d por braço | maxIter=%d", modelName, N, maxIter)
-	t.Logf("")
-	t.Logf("BRAÇO A (com diagnóstico real do compilador):")
-	t.Logf("  Taxa de sucesso:             %.1f%% (%d/%d)", srA*100, N-failA, N)
-	t.Logf("  Falhou em 4 tentativas:      %d (%.1f%%)", failA, float64(failA)/float64(N)*100)
-	t.Logf("  Distribuição de iterações:   1=%d 2=%d 3=%d 4=%d", distA[1], distA[2], distA[3], distA[4])
-	t.Logf("  Duração média por rodada:    %s", avgDurA.Round(time.Millisecond))
-	t.Logf("  Tokens: in=%d out=%d | Custo estimado: $%.5f", tokInA, tokOutA, costA)
-	t.Logf("")
-	t.Logf("BRAÇO B (sem diagnóstico — 'Build failed. Try again.'):")
-	t.Logf("  Taxa de sucesso:             %.1f%% (%d/%d)", srB*100, N-failB, N)
-	t.Logf("  Falhou em 4 tentativas:      %d (%.1f%%)", failB, float64(failB)/float64(N)*100)
-	t.Logf("  Distribuição de iterações:   1=%d 2=%d 3=%d 4=%d", distB[1], distB[2], distB[3], distB[4])
-	t.Logf("  Duração média por rodada:    %s", avgDurB.Round(time.Millisecond))
-	t.Logf("  Tokens: in=%d out=%d | Custo estimado: $%.5f", tokInB, tokOutB, costB)
-	t.Logf("")
-
-	diff := srA - srB
-	switch {
-	case diff > 0.10:
-		t.Logf("CONCLUSÃO: Diagnóstico ajuda — Braço A %.1f pp melhor que B.", diff*100)
-	case diff < -0.10:
-		t.Logf("CONCLUSÃO: Surpreendente — Braço B %.1f pp melhor que A (sem diagnóstico).", -diff*100)
-	default:
-		t.Logf("CONCLUSÃO: sem diferença na TAXA DE SUCESSO (diff=%.1f pp).", diff*100)
-		// Empate na taxa de sucesso NÃO significa que o laço está quebrado. Se
-		// todas as rodadas dos dois braços convergirem no mesmo número de
-		// iterações, o que a medição mostrou é que o CASO DE TESTE não
-		// discrimina — e concluir "o laço não funciona" a partir disso é ler o
-		// experimento ao contrário. Foi o que a primeira versão fazia.
-		if degenerada(distA) && degenerada(distB) {
-			t.Logf("  → ATENÇÃO: distribuição degenerada — todas as rodadas dos DOIS braços")
-			t.Logf("    convergiram no mesmo número de iterações. O caso de teste não")
-			t.Logf("    discrimina: o modelo resolve sem precisar do diagnóstico.")
-			t.Logf("    Isto NÃO é evidência de que o laço falhou; é evidência de que o")
-			t.Logf("    caso é fácil demais. Use um erro que não se veja relendo o arquivo.")
-		} else {
-			t.Logf("  → O diagnóstico não mudou o acerto neste caso. Compare o custo abaixo.")
-		}
-	}
-	// O custo é a outra metade da resposta, e some se só se olhar acerto.
-	if tokInA > 0 && tokOutA > 0 {
-		t.Logf("CUSTO: B gasta %.0f%% mais tokens de entrada e %.0f%% mais de saída que A.",
-			100*(float64(tokInB)/float64(tokInA)-1), 100*(float64(tokOutB)/float64(tokOutA)-1))
-	}
-	t.Logf("══════════════════════════════════════════════════")
-
-	// ── Grava MEDICAO.md ──────────────────────────────────────────────────────
-
-	report := buildMedicaoReport(modelName, proxyURL, N, maxIter,
-		srA, distA, failA, avgDurA, tokInA, tokOutA, costA,
-		srB, distB, failB, avgDurB, tokInB, tokOutB, costB,
-		bracoA.resultados, bracoB.resultados)
+	report := buildMedicaoReport(modelName, proxyURL, N, maxIter, todosCenarios, resultadosPorCenario)
 
 	medicaoPath := "MEDICAO.md"
 	if err := os.WriteFile(medicaoPath, []byte(report), 0644); err != nil {
@@ -486,37 +555,53 @@ func TestForge_MeasureConvergenceWithVsWithoutDiagnostics(t *testing.T) {
 	}
 }
 
+// cenarioNomes retorna os nomes dos cenários separados por vírgula.
+func cenarioNomes() string {
+	nomes := make([]string, len(todosCenarios))
+	for i, c := range todosCenarios {
+		nomes[i] = c.nome
+	}
+	return strings.Join(nomes, ", ")
+}
+
+// computeMetrics calcula métricas agregadas a partir de uma lista de resultados.
+func computeMetrics(resultados []runResult) (successRate float64, dist map[int]int, failIn4 int, avgDur time.Duration, tokIn, tokOut int64) {
+	dist = map[int]int{1: 0, 2: 0, 3: 0, 4: 0}
+	var totalDur time.Duration
+	for _, r := range resultados {
+		if r.Success {
+			key := r.CompilationIter
+			if key < 1 {
+				key = 1
+			}
+			if key > 4 {
+				key = 4
+			}
+			dist[key]++
+		} else {
+			failIn4++
+		}
+		totalDur += r.Duration
+		tokIn += r.TokensIn
+		tokOut += r.TokensOut
+	}
+	successRate = float64(len(resultados)-failIn4) / float64(len(resultados))
+	if len(resultados) > 0 {
+		avgDur = totalDur / time.Duration(len(resultados))
+	}
+	return
+}
+
 func buildMedicaoReport(
 	modelName, proxyURL string,
 	N, maxIter int,
-	srA float64, distA map[int]int, failA int, avgDurA time.Duration, tokInA, tokOutA int64, costA float64,
-	srB float64, distB map[int]int, failB int, avgDurB time.Duration, tokInB, tokOutB int64, costB float64,
-	resultsA, resultsB []runResult,
+	cenarios []cenario,
+	resultadosPorCenario []parBracosResultado,
 ) string {
 	now := time.Now().UTC().Format(time.RFC3339)
-	diff := srA - srB
 
-	var conclusao string
-	switch {
-	case diff > 0.10:
-		conclusao = fmt.Sprintf("Diagnóstico ajuda: Braço A %.1f pp melhor que B.", diff*100)
-	case diff < -0.10:
-		conclusao = fmt.Sprintf("Surpreendente: Braço B %.1f pp melhor que A (sem diagnóstico).", -diff*100)
-	default:
-		conclusao = fmt.Sprintf("**SEM DIFERENÇA SIGNIFICATIVA** (diff=%.1f pp). "+
-			"O laço agêntico pode não estar funcionando como esperado.", diff*100)
-	}
-
-	// Linha por linha dos resultados individuais
-	var rowsA, rowsB strings.Builder
-	for i, r := range resultsA {
-		rowsA.WriteString(fmt.Sprintf("| %d | %v | %d | %s | %d | %d |\n",
-			i+1, r.Success, r.CompilationIter, r.Duration.Round(time.Millisecond), r.TokensIn, r.TokensOut))
-	}
-	for i, r := range resultsB {
-		rowsB.WriteString(fmt.Sprintf("| %d | %v | %d | %s | %d | %d |\n",
-			i+1, r.Success, r.CompilationIter, r.Duration.Round(time.Millisecond), r.TokensIn, r.TokensOut))
-	}
+	const costPerMIn = 0.27 / 1_000_000
+	const costPerMOut = 1.10 / 1_000_000
 
 	var sb strings.Builder
 	sb.WriteString("# MEDICAO.md — Forge Agentic Loop: Com vs Sem Diagnostico\n\n")
@@ -526,39 +611,79 @@ func buildMedicaoReport(
 	sb.WriteString(fmt.Sprintf("**N por braco:** %d\n", N))
 	sb.WriteString(fmt.Sprintf("**MaxIteracoes:** %d\n", maxIter))
 	sb.WriteString("**Sandbox:** Docker real (UseDocker=true), build tsc+vite real\n\n---\n\n")
-	sb.WriteString("## Resumo\n\n")
-	sb.WriteString("| Metrica | Braco A (com diagnostico) | Braco B (sem diagnostico) |\n")
-	sb.WriteString("|---|---|---|\n")
-	sb.WriteString(fmt.Sprintf("| Taxa de sucesso | %.1f%% (%d/%d) | %.1f%% (%d/%d) |\n",
-		srA*100, N-failA, N, srB*100, N-failB, N))
-	sb.WriteString(fmt.Sprintf("| Falhou em %d iter | %d (%.1f%%) | %d (%.1f%%) |\n",
-		maxIter, failA, float64(failA)/float64(N)*100, failB, float64(failB)/float64(N)*100))
-	sb.WriteString(fmt.Sprintf("| Dist. iter 1/2/3/4 | %d/%d/%d/%d | %d/%d/%d/%d |\n",
-		distA[1], distA[2], distA[3], distA[4],
-		distB[1], distB[2], distB[3], distB[4]))
-	sb.WriteString(fmt.Sprintf("| Duracao media | %s | %s |\n",
-		avgDurA.Round(time.Millisecond), avgDurB.Round(time.Millisecond)))
-	sb.WriteString(fmt.Sprintf("| Tokens in/out | %d/%d | %d/%d |\n",
-		tokInA, tokOutA, tokInB, tokOutB))
-	sb.WriteString(fmt.Sprintf("| Custo estimado USD | $%.5f | $%.5f |\n\n",
-		costA, costB))
-	sb.WriteString(fmt.Sprintf("**Conclusao:** %s\n\n---\n\n", conclusao))
-	sb.WriteString("## Braco A -- Com diagnostico real (arquivo, linha, codigo TS)\n\n")
-	sb.WriteString("| Rodada | Sucesso | Iter compilou | Duracao | Tokens In | Tokens Out |\n")
-	sb.WriteString("|---|---|---|---|---|---|\n")
-	sb.WriteString(rowsA.String())
-	sb.WriteString("\n## Braco B -- Sem diagnostico (\"Build failed. Try again.\")\n\n")
-	sb.WriteString("| Rodada | Sucesso | Iter compilou | Duracao | Tokens In | Tokens Out |\n")
-	sb.WriteString("|---|---|---|---|---|---|\n")
-	sb.WriteString(rowsB.String())
-	sb.WriteString("\n---\n\n## Notas metodologicas\n\n")
-	sb.WriteString("- Ambos os bracos partem do mesmo app quebrado: src/App.tsx com Calendar nao importado.\n")
-	sb.WriteString("- O prompt inicial e identico; so o retorno da ferramenta compilar difere entre os bracos.\n")
-	sb.WriteString("- Braco A: compilar devolve diagnosticos estruturados (arquivo, linha, codigo TS2304, mensagem).\n")
-	sb.WriteString("- Braco B: compilar devolve apenas \"Build failed. Try again.\" -- sem arquivo, sem linha, sem simbolo.\n")
+
+	for i, cen := range cenarios {
+		res := resultadosPorCenario[i]
+		srA, distA, failA, avgDurA, tokInA, tokOutA := computeMetrics(res.bracoA)
+		srB, distB, failB, avgDurB, tokInB, tokOutB := computeMetrics(res.bracoB)
+		costA := float64(tokInA)*costPerMIn + float64(tokOutA)*costPerMOut
+		costB := float64(tokInB)*costPerMIn + float64(tokOutB)*costPerMOut
+		diff := srA - srB
+
+		var conclusao string
+		switch {
+		case diff > 0.10:
+			conclusao = fmt.Sprintf("Diagnóstico ajuda: Braço A %.1f pp melhor que B.", diff*100)
+		case diff < -0.10:
+			conclusao = fmt.Sprintf("Surpreendente: Braço B %.1f pp melhor que A (sem diagnóstico).", -diff*100)
+		default:
+			conclusao = fmt.Sprintf("**SEM DIFERENÇA SIGNIFICATIVA** (diff=%.1f pp). "+
+				"O laço agêntico pode não estar funcionando como esperado.", diff*100)
+		}
+
+		sb.WriteString(fmt.Sprintf("## Cenário: %s\n\n", cen.nome))
+		sb.WriteString("| Metrica | Braco A (com diagnostico) | Braco B (sem diagnostico) |\n")
+		sb.WriteString("|---|---|---|\n")
+		sb.WriteString(fmt.Sprintf("| Taxa de sucesso | %.1f%% (%d/%d) | %.1f%% (%d/%d) |\n",
+			srA*100, N-failA, N, srB*100, N-failB, N))
+		sb.WriteString(fmt.Sprintf("| Falhou em %d iter | %d (%.1f%%) | %d (%.1f%%) |\n",
+			maxIter, failA, float64(failA)/float64(N)*100, failB, float64(failB)/float64(N)*100))
+		sb.WriteString(fmt.Sprintf("| Dist. iter 1/2/3/4 | %d/%d/%d/%d | %d/%d/%d/%d |\n",
+			distA[1], distA[2], distA[3], distA[4],
+			distB[1], distB[2], distB[3], distB[4]))
+		sb.WriteString(fmt.Sprintf("| Duracao media | %s | %s |\n",
+			avgDurA.Round(time.Millisecond), avgDurB.Round(time.Millisecond)))
+		sb.WriteString(fmt.Sprintf("| Tokens in/out | %d/%d | %d/%d |\n",
+			tokInA, tokOutA, tokInB, tokOutB))
+		sb.WriteString(fmt.Sprintf("| Custo estimado USD | $%.5f | $%.5f |\n\n",
+			costA, costB))
+		sb.WriteString(fmt.Sprintf("**Conclusao:** %s\n\n", conclusao))
+
+		// Linhas individuais — Braço A
+		sb.WriteString("### Braço A — Com diagnostico real\n\n")
+		sb.WriteString("| Rodada | Sucesso | Iter compilou | Duracao | Tokens In | Tokens Out |\n")
+		sb.WriteString("|---|---|---|---|---|---|\n")
+		for j, r := range res.bracoA {
+			sb.WriteString(fmt.Sprintf("| %d | %v | %d | %s | %d | %d |\n",
+				j+1, r.Success, r.CompilationIter, r.Duration.Round(time.Millisecond), r.TokensIn, r.TokensOut))
+		}
+		sb.WriteString("\n")
+
+		// Linhas individuais — Braço B
+		sb.WriteString("### Braço B — Sem diagnostico (\"Build failed. Try again.\")\n\n")
+		sb.WriteString("| Rodada | Sucesso | Iter compilou | Duracao | Tokens In | Tokens Out |\n")
+		sb.WriteString("|---|---|---|---|---|---|\n")
+		for j, r := range res.bracoB {
+			sb.WriteString(fmt.Sprintf("| %d | %v | %d | %s | %d | %d |\n",
+				j+1, r.Success, r.CompilationIter, r.Duration.Round(time.Millisecond), r.TokensIn, r.TokensOut))
+		}
+		sb.WriteString("\n---\n\n")
+	}
+
+	sb.WriteString("## Notas metodologicas\n\n")
+	sb.WriteString("- Cenário **import-faltando**: src/App.tsx usa <Calendar /> sem importar de lucide-react.\n")
+	sb.WriteString("  Erro visível relendo o arquivo; cenário de referência histórico.\n")
+	sb.WriteString("- Cenário **erro-entre-arquivos**: src/types.ts e src/App.tsx têm erros interdependentes.\n")
+	sb.WriteString("  - types.ts: emptyCard() retorna objeto sem 'total' (TS2741 em types.ts)\n")
+	sb.WriteString("  - App.tsx: passa total como string em vez de number (TS2322 em App.tsx)\n")
+	sb.WriteString("  - Lendo só App.tsx, não é possível saber qual arquivo corrigir.\n")
+	sb.WriteString("  - Prova da discriminação: CENARIO-2-PROVA.txt (saída real do tsc antes das rodadas)\n")
+	sb.WriteString("- Braço A: compilar devolve diagnosticos estruturados (arquivo, linha, codigo TS, mensagem).\n")
+	sb.WriteString("- Braço B: compilar devolve apenas \"Build failed. Try again.\" -- sem arquivo, sem linha, sem simbolo.\n")
 	sb.WriteString("- \"Iter compilou\" = numero da chamada a compilar quando retornou ok:true. 0 = nao compilou.\n")
 	sb.WriteString("- Custo estimado com tarifa deepseek-v4-flash: $0.27/M input, $1.10/M output.\n")
-	sb.WriteString("- Se nao houver diferenca entre bracos, esse e o resultado principal.\n")
+	sb.WriteString("- Se nao houver diferenca entre bracos em import-faltando, e resultado esperado (caso facil).\n")
+	sb.WriteString("- O cenario erro-entre-arquivos e o que deve discriminar os bracos.\n")
 	return sb.String()
 }
 

@@ -1,0 +1,47 @@
+CENARIO-2-PROVA: erro-entre-arquivos
+Data da prova: 2026-09-14T02:24:05Z
+Imagem Docker: node:22-alpine
+TypeScript: Version 5.9.3
+Comando: ./node_modules/.bin/tsc --noEmit
+
+Arquivos do cenário:
+  src/types.ts:
+    export interface CardProps {
+      titulo: string;
+      total: number;
+    }
+
+    // ERRO INTENCIONAL: função afirma retornar CardProps mas omite campo 'total'
+    export function emptyCard(): CardProps {
+      return { titulo: '' };
+    }
+
+  src/App.tsx:
+    import React from 'react';
+    import { CardProps, emptyCard } from './types';
+
+    function Dashboard({ titulo, total }: CardProps) {
+      return <div className="p-4">{titulo}: {total}</div>;
+    }
+
+    export function App() {
+      const card = emptyCard();
+      // ERRO INTENCIONAL: total deveria ser number, mas passamos string
+      return <Dashboard titulo={card.titulo} total={"cem"} />;
+    }
+
+    export default App;
+
+Saída RAW do tsc (real, sem modificação):
+---
+src/App.tsx(11,42): error TS2322: Type 'string' is not assignable to type 'number'.
+src/types.ts(8,3): error TS2741: Property 'total' is missing in type '{ titulo: string; }' but required in type 'CardProps'.
+---
+
+Conclusão: O cenário DISCRIMINA.
+  - src/App.tsx é citado na linha 11 (total="cem" em vez de number)
+  - src/types.ts é citado na linha 8 (emptyCard retorna sem 'total')
+  - Lendo apenas App.tsx, não é possível saber se o erro está em App.tsx (que passa "cem")
+    ou em types.ts (cujo emptyCard não preenche 'total').
+  - O braço A (com diagnóstico) recebe ambas as linhas; o braço B recebe apenas
+    "Build failed. Try again." — sem saber em qual arquivo corrigir.
