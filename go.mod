@@ -1,6 +1,7 @@
 module urag-adk-go
 
-go 1.25.0
+go 1.26.0
+toolchain go1.26.8
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.4.1
