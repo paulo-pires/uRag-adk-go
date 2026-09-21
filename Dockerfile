@@ -1,6 +1,7 @@
 FROM golang:1.25-alpine AS build
-WORKDIR /src
+WORKDIR /work/uRag-adk-go
 COPY go.mod go.sum ./
+COPY --from=glitchtip . /work/pkg/glitchtip
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/agent ./cmd/agent
