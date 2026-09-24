@@ -51,6 +51,7 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
+	"urag-stack/pkg/glitchtip"
 
 	"urag-adk-go/internal/guard"
 	filemem "urag-adk-go/internal/memory"
@@ -745,6 +746,10 @@ func main() {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 	registerCopilotRoutes(mux)
+	mux.HandleFunc("/internal/glitchtip-test", glitchtip.RequireToken("X-Internal-Token", getenv("URAG_INTERNAL_TOKEN", os.Getenv("ADK_INTERNAL_TOKEN")), glitchtip.TestHandler("adk")))
+
+	glitchtip.InitFromEnv("adk")
+	defer glitchtip.Flush()
 
 	addr := getenv("AGENT_HTTP_ADDR", ":8081")
 	log.Printf("uRag ADK agent (MCP) ouvindo em %s", addr)
@@ -753,7 +758,7 @@ func main() {
 	if u := os.Getenv("GUARD_URL"); u != "" {
 		log.Printf("  Guard: %s", u)
 	}
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, glitchtip.Wrap(mux)))
 }
 
 // ── guardrail engine ──────────────────────────────────────────────────────────

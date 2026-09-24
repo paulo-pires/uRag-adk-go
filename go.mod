@@ -9,6 +9,8 @@ require (
 	google.golang.org/genai v1.57.0
 )
 
+require github.com/getsentry/sentry-go v0.36.2 // indirect
+
 require (
 	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/auth v0.20.0 // indirect
@@ -50,8 +52,11 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260511170946-3700d4141b60 // indirect
 	google.golang.org/grpc v1.81.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gorm.io/driver/postgres v1.6.0 // indirect
-	gorm.io/gorm v1.31.2 // indirect
+	gorm.io/driver/postgres v1.6.0
+	gorm.io/gorm v1.31.2
 	rsc.io/omap v1.2.0 // indirect
 	rsc.io/ordered v1.1.1 // indirect
+	urag-stack/pkg/glitchtip v0.0.0
 )
+
+replace urag-stack/pkg/glitchtip => ../pkg/glitchtip
