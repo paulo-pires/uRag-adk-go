@@ -1,6 +1,7 @@
 module urag-adk-go
 
 go 1.26.0
+
 toolchain go1.26.8
 
 require (
@@ -9,7 +10,7 @@ require (
 	google.golang.org/genai v1.57.0
 )
 
-require github.com/getsentry/sentry-go v0.36.2 // indirect
+require github.com/getsentry/sentry-go v0.50.0 // indirect
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -45,9 +46,9 @@ require (
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/api v0.279.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260511170946-3700d4141b60 // indirect
 	google.golang.org/grpc v1.81.0 // indirect
